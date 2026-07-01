@@ -22,6 +22,7 @@ from pathlib import Path
 
 from benchflow.agents.registry import AGENT_INSTALLERS, AGENTS, AgentConfig
 from benchflow.models import AgentInstallError
+from benchflow.sandbox.singularity.singularity import SingularitySandbox
 from benchflow.skill_policy import validate_container_mount_path
 
 logger = logging.getLogger(__name__)
@@ -299,7 +300,9 @@ async def deploy_skills(
         dockerfile = task_path / "environment" / "Dockerfile"
         injected_copy = f"COPY _deps/skills {target_skills_dir.rstrip('/')}/"
         already_injected = (
-            dockerfile.exists() and injected_copy in dockerfile.read_text()
+            not isinstance(env, SingularitySandbox)  # singularity sandbox is not built from dockerfile
+            and dockerfile.exists()
+            and injected_copy in dockerfile.read_text()
         )
         if not already_injected:
             skills_path = Path(skills_dir)

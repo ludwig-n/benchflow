@@ -35,6 +35,10 @@ _PROVIDERS: tuple[SandboxProvider, ...] = (
     SandboxProvider("docker", extra=None, off_box_model=False),
     SandboxProvider("daytona", extra="sandbox-daytona", off_box_model=True),
     SandboxProvider("modal", extra="sandbox-modal", off_box_model=True),
+    # We set off_box_model=True to force the LLM proxy to be set up in the sandbox, not on the host.
+    # This is done to avoid installing litellm on the host,
+    # because BenchFlow's preferred litellm 1.89.0 is incompatible with Nemo-Gym 0.4.0rc0.
+    SandboxProvider("singularity", extra=None, off_box_model=True),
 )
 
 PROVIDERS_BY_NAME: dict[str, SandboxProvider] = {p.name: p for p in _PROVIDERS}

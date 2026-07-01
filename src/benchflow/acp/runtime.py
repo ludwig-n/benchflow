@@ -20,11 +20,13 @@ Does not own:
 import asyncio
 import contextlib
 import logging
+import shlex
 from datetime import UTC, datetime
 from pathlib import Path
 
 from benchflow.acp.client import ACPClient
 from benchflow.acp.container_transport import ContainerTransport
+from benchflow.acp.transport import StdioTransport
 from benchflow.acp.types import McpServerSpec
 from benchflow.agents.protocol import ACPSessionAdapter
 from benchflow.agents.providers import (
@@ -41,6 +43,7 @@ from benchflow.diagnostics import (
 )
 from benchflow.sandbox.lockdown import build_priv_drop_cmd
 from benchflow.sandbox.process import DaytonaProcess, DaytonaPtyProcess, DockerProcess
+from benchflow.task.paths import SandboxPaths
 from benchflow.trajectories._capture import _capture_session_trajectory
 
 # Re-exported for backwards compatibility — tests and downstream code
@@ -54,6 +57,9 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+singularity_acp_launch_lock = asyncio.Lock()
+SINGULARITY_ACP_LAUNCH_TIMEOUT = 30
 
 
 _ACP_CONNECT_MAX_RETRIES = 3
@@ -471,26 +477,56 @@ async def connect_acp(
             await asyncio.sleep(delay)
 
         try:
-            if environment == "docker":
-                live_proc = DockerProcess.from_sandbox_env(env)
-            else:
-                is_dind = hasattr(env, "_strategy") and hasattr(
-                    env._strategy, "_compose_cmd"
-                )
-                if is_dind:
-                    live_proc = await DaytonaPtyProcess.from_sandbox_env(env)
-                    logger.info("Using PTY transport for DinD compose task")
-                else:
-                    live_proc = await DaytonaProcess.from_sandbox_env(env)
+            if environment == "singularity":
+                agent_stderr_path = SandboxPaths.agent_dir / "agent-stderr.txt"
 
-            agent_log = rollout_dir / "agent" / f"{agent.replace('-', '_')}.txt"
-            transport = ContainerTransport(
-                container_process=live_proc,
-                command=agent_launch,
-                env=agent_env,
-                cwd=agent_cwd,
-                agent_log_path=agent_log,
-            )
+                # Launch an ACP server inside the environment using ncat.
+                # Use a lock to ensure only one ACP server is launched at a time, preventing port conflicts.
+                async with singularity_acp_launch_lock:
+                    sock, port = env._reserve_port()
+                    sock.close()
+                    logger.info(f"Launching ACP server with environment: {str(agent_env)}")
+                    await env.exec(
+                        f"ncat -l 127.0.0.1 {port} --sh-exec {shlex.quote(agent_launch + f' 2>{agent_stderr_path}')} >/dev/null 2>&1 &",
+                        env=agent_env,
+                    )
+
+                    # Wait for the server to start before releasing the lock.
+                    try:
+                        res = await env.exec(
+                            f"while ! grep -q ':{port:04X} ' /proc/net/tcp; do sleep 1; done",
+                            timeout_sec=SINGULARITY_ACP_LAUNCH_TIMEOUT
+                        )
+                        # env.exec can either throw a TimeoutError itself, or return code 124, which also means timeout.
+                        if res.return_code == 124:
+                            raise asyncio.TimeoutError()
+                    except asyncio.TimeoutError:
+                        raise ValueError(f"ACP server failed to start after {SINGULARITY_ACP_LAUNCH_TIMEOUT} seconds")
+
+                # Communicate with the launched ACP server via ncat.
+                transport = StdioTransport("ncat", ["127.0.0.1", str(port)])
+            else:
+                if environment == "docker":
+                    live_proc = DockerProcess.from_sandbox_env(env)
+                else:
+                    is_dind = hasattr(env, "_strategy") and hasattr(
+                        env._strategy, "_compose_cmd"
+                    )
+                    if is_dind:
+                        live_proc = await DaytonaPtyProcess.from_sandbox_env(env)
+                        logger.info("Using PTY transport for DinD compose task")
+                    else:
+                        live_proc = await DaytonaProcess.from_sandbox_env(env)
+
+                agent_log = rollout_dir / "agent" / f"{agent.replace('-', '_')}.txt"
+                transport = ContainerTransport(
+                    container_process=live_proc,
+                    command=agent_launch,
+                    env=agent_env,
+                    cwd=agent_cwd,
+                    agent_log_path=agent_log,
+                )
+
             acp_client = ACPClient(transport)
             await acp_client.connect()
 
